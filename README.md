@@ -1,142 +1,122 @@
-# VOCANO: A note transcription framework for singing voice in polyphonic music
+## AINoteTranscription (VOCANO-based)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/B05901022/VOCANO/blob/main/VOCANO.ipynb)
+This project is inherited from the original VOCANO: A note transcription framework for singing voice in polyphonic music. We keep the core pipeline (Patch-CNN pitch extraction + note segmentation), modernize the runtime, and add experimental options.
 
-Inference code of our work **VOCANO: A note transcription framework for singing voice in polyphonic music**. For training details, please check [this repo][Note-Segmentation-SSL]. **This work is now also working as part of the [Omnizart][Omnizart] project, which is able to transcribe pitched instruments, vocal melody, chords, drum events, and beat.** Complete demo including the whole Omnizart transcription pipeline is available on the [Omnizart Website][Omnizart Website]. Omnizart is powered by the research outcomes from [Music and Culture Technology (MCT) Lab][Music and Culture Technology (MCT) Lab].
+### What’s different from upstream VOCANO
+- **Modern dependencies**: requirements updated for current CUDA/PyTorch and libraries (see requirements below). No NVIDIA Apex is required; uses PyTorch AMP when enabled.
+- **Checkpoints auto-download**: model files are fetched via Google Drive on first run.
+- **Experimental models**: optional GRU + Attention note segmentation variants are wired in but require training (see GRU_ATTENTION_TRAINING.md).
+- **Utilities for accuracy**: added `vocano/utils/refine.py` to refine onsets/offsets for better Note Accuracy (NAcc).
 
-## Overview
+## Requirements (modernized)
 
-In this repository, we present a VOCAl NOte transcription tool, named VOCANO, which can help transcribing vocal into MIDI files. We decompose singing voice transcription(SVT) into two parts: pitch extraction and note segmentation. Our pitch extraction model is a pre-trained Patch-CNN, which was from [our previous work][Vocal melody extraction using patch-based CNN]; our note segmentation is a PyramidNet-110 with ShakeDrop regularization, which is an improvement from [Hierarchical classification networks][Hierarchical classification networks for singing voice segmentation and transcription] trained by semi-supervised learning. See our paper for more details.
+Tested on Python 3.10+ with CUDA 12.x. Key pinned packages (see `requirements.txt`):
+- torch==2.8.0+cu124, torchvision==0.23.0+cu124 (from the CUDA 12.4 extra index)
+- numpy==2.3.3, scipy==1.16.2
+- librosa==0.11.0, pretty-midi==0.2.9
+- cupy-cuda12x==13.6.0 (optional, enables GPU CFP feature extraction)
+- tqdm, matplotlib, pandas, googledrivedownloader
 
-## Demo
-
-Examples using CMedia dataset and ISMIR2014 dataset are shown [here][Our demo googledrive].
-
-## Requirements
-
-Our testing is performed under Python3 and CUDA10.1, under PyTorch framework. You can either use our `requirements.txt` or manually install packages needed. For faster inferencing under NVIDIA GTX/RTX devices, it is recommended to install [CuPy][CuPy] and use `-use_cp` flag while running our code.
-
-### Clone this repository
-
+Install with:
 ```bash
-$ git clone https://github.com/B05901022/VOCANO.git
-$ cd VOCANO
+pip install -r requirements.txt
 ```
 
-### Install [NVIDIA-apex][NVIDIA-apex]
+Notes:
+- AMP/mixed precision uses native PyTorch; Apex is not needed.
+- If you install a different CUDA build, adjust the PyTorch wheels accordingly.
 
+## Quick start
+
+1) Put your input audio `.wav` somewhere on disk.
+
+2) Run the transcription entrypoint (end-to-end):
 ```bash
-$ git clone https://github.com/NVIDIA/apex.git
-$ pip install -v --disable-pip-version-check --no-cache-dir ./apex
-$ bash setup.sh
+python -m vocano.transcription -n output_name -wd path/to/input.wav
 ```
 
-### Install requirements
+Useful flags (as parsed by `vocano/core.py`):
+- `-d cpu|<gpu_id>|auto` device selection (`auto` supported on Linux only).
+- `-use_cp` enable CuPy-accelerated CFP extraction when `cupy-cuda12x` is installed.
+- `-s` save extracted features/pitch to `generated/feat` and `generated/pitch`.
+- `-use_pre` reuse previously extracted features/pitch for faster runs.
+- `-ckpt` path to a model checkpoint (defaults are auto-downloaded when using PyramidNet).
+- `-mt`/`-model_type` choose `pyramidnet` (default), `gru_attention`, or `simplified_gru_attention`.
+- `-bz` `-nw` `-pn` batch size, workers, and pin-memory for dataloaders.
 
-```bash
-$ pip install -r requirements.txt -f https://download.pytorch.org/whl/torch_stable.html
-```
+Outputs are written to:
+- MIDI: `generated/midi/<name>.mid`
+- Synthesized audio: `generated/wav/<name>.wav`
+- Raw model logits sample: `ond/<name>_raw_outputs.npy|.csv` (for inspection)
 
-## How to run
+## Pipeline overview
 
-We provided a preprocessing code and a transcription which includes the whole pipeline. Preprocessing can extract numpy feature and pitch contour for our second phase note segmentation, which you can set `-use_pre` flag for using pre-extracted informations. Note that our note segmentation model is trained on monophonic data, thus using an additional source separation model is recommended for polyphonic cases. See appendix for more information.
+The VOCANO inference decomposes SVT into two parts:
+- Pitch extraction: Patch-CNN (checkpoint auto-downloaded).
+- Note segmentation: PyramidNet-110 with ShakeDrop (default), or experimental GRU+Attention variants.
 
-### Preprocessing(Optional)
+The `vocano/core.py` class orchestrates:
+- model/file downloads, device selection, CFP feature extraction (NumPy or CuPy), inference with optional AMP, post-processing (Smooth_sdt6_modified), and MIDI synthesis.
 
-The preprocessing code extracts CFP feature which is used in our note segmentation model and pitch contour extracted by Patch-CNN.
+## Improving Note Accuracy (NAcc) with sub-frame refinement
 
+File: `vocano/utils/refine.py`
+
+Purpose: refine onset/offset boundary times between 20 ms frames using a spectral-flux proxy from the CFP feature, yielding tighter boundaries and potentially higher NAcc.
+
+How it works (summary):
+- Build a per-frame spectral-flux curve from the first 522 CFP rows.
+- Around each coarse boundary, take a small window, upsample by linear interpolation, and pick a sub-frame time by either peak or threshold-crossing.
+- Constrain results between adjacent frame centers to preserve note count and ordering.
+
+Example usage after you obtain `feature` and `pitch_intervals` from the normal pipeline:
 ```python
-python -m vocano.preprocess -n [output_file_name] -wd [input_wavfile] -s
+from vocano.utils.refine import refine_intervals_with_flux
+
+refined = refine_intervals_with_flux(
+    feature=feature,               # (1566, T) CFP
+    pitch_intervals=pitch_intervals,  # (N, 2) [start_s, end_s]
+    window_frames=2,
+    upsample=10,
+    method="peak",               # or "cross"
+    alpha=0.3                     # for crossing threshold
+)
+# Use `refined` in place of `pitch_intervals` for MIDI/export/evaluation.
 ```
 
-Use `-d` flag to choose which devices to be used. The default device is `-d cpu`, but you can also choose `-d [device id]` to select your gpu or `-d auto` to automatically select the least used gpu (only for Linux). Use `-use_cp` to enable gpu acceleration for feature extraction when cupy is installed. Set `-bz [batchsize] -nw [num_workers] -pn` to fit your device while feeding data.
+This utility is not mandatory for running the baseline, but is provided as an accuracy-oriented post-process step.
 
-### Transcription
+## Experimental: GRU + Attention note segmentation (training required)
 
-The transcription code executes the full pipeline which includes preprocessing and note segmentation.
+We expose optional GRU+Attention models in `vocano/core.py` as `-mt gru_attention` or `-mt simplified_gru_attention`. These models need training before meaningful inference. See:
+- `GRU_ATTENTION_TRAINING.md` — training guide, options, outputs, and usage.
 
-```python
-python -m vocano.transcription -n [output_file_name] -wd [input_wavfile] 
-```
+Until you train and provide `-ckpt` for these models, the code will fall back to random initialization and warn you.
 
-If preprocessing is done before transcription, set `use_pre` flag to skip the step. Device can also be selected by setting the `-d` flag. Cupy can also be enabled by `-use_cp` flag. Set `-bz [batchsize] -nw [num_workers] -pn -al [amp_level]` to fit your device while feeding data and inferencing. 
+## Tips
 
-If you have a better melody transcription model or groundtruth melody, you can also convert extracted melody into our form (see Appendix), and set `-pd [your_pitch_directory]`.
-
-Transcribed results can be found under `VOCANO/generated/wav/` and `VOCANO/generated/midi/`.
-
-## Appendix
-
-### Source separation for polyphonic vocal
-
-Recently, multiple source separation models like [Demucs][Demucs] are developed which gives clear vocal separation results that fits in our model. Vocal files preprocessed by source separation methods are expected to give more promising results on polyphonic audio files. Note that extracted vocal files should be in .wav format. Results transcribed with demucs and our work can be seen in our demo section.
-
-### Using your own melody extraction model
-
-If you wish to use your own melody extraction model, please export your extracted pitch in length of our extracted feature (feature.shape[1]), and data in Hertz unit. The dtype of exported pitch should be np.float64.
+- For polyphonic audio, consider separating vocals first (e.g., Demucs) and run transcription on the vocal stem for better results.
+- Windows users: `-d auto` is Linux-only; specify `-d cpu` or a concrete GPU id on Windows.
+- CuPy acceleration is optional; if memory is insufficient, the code automatically falls back to NumPy and frees GPU memory between steps.
 
 ## Citation
 
-If you find our work useful, please consider citing our paper.
+Please cite the original VOCANO and Omnizart works:
 
-* VOCANO
 ```
 @inproceedings{vocano,
-	title={{VOCANO}: A Note Transcription Framework For Singing Voice In Polyphonic Music},
-	author={Hsu, Jui-Yang and Su, Li},
-	booktitle={Proc. International Society of Music Information Retrieval Conference (ISMIR)},
-	year={2021}
+  title={{VOCANO}: A Note Transcription Framework For Singing Voice In Polyphonic Music},
+  author={Hsu, Jui-Yang and Su, Li},
+  booktitle={Proc. International Society of Music Information Retrieval Conference (ISMIR)},
+  year={2021}
 }
-``` 
+```
 
-* Omnizart
 ```
 @article{wu2021omnizart,
-	title={Omnizart: A General Toolbox for Automatic Music Transcription},
-	author={Wu, Yu-Te and Luo, Yin-Jyun and Chen, Tsung-Ping and Wei, I-Chieh and Hsu, Jui-Yang and Chuang, Yi-Chin and Su, Li},
-	journal={arXiv preprint arXiv:2106.00497},
-	year={2021}
+  title={Omnizart: A General Toolbox for Automatic Music Transcription},
+  author={Wu, Yu-Te and Luo, Yin-Jyun and Chen, Tsung-Ping and Wei, I-Chieh and Hsu, Jui-Yang and Chuang, Yi-Chin and Su, Li},
+  journal={arXiv preprint arXiv:2106.00497},
+  year={2021}
 }
 ```
-
-[Note-Segmentation-SSL]: https://github.com/B05901022/Note-Segmentation-SSL
-[Omnizart]: https://github.com/Music-and-Culture-Technology-Lab/omnizart
-[Omnizart Website]: https://music-and-culture-technology-lab.github.io/omnizart-doc/
-[Music and Culture Technology (MCT) Lab]: https://sites.google.com/view/mctl/home
-[NVIDIA-apex]: https://github.com/NVIDIA/apex
-[Vocal melody extraction using patch-based CNN]: https://arxiv.org/abs/1804.09202
-[Hierarchical classification networks for singing voice segmentation and transcription]: http://archives.ismir.net/ismir2019/paper/000111.pdf
-[Our demo googledrive]: https://drive.google.com/drive/folders/1Ebao0fih7JtXHNZ1XCu6WHYQTVsl7c8J?usp=sharing
-[CuPy]: https://github.com/cupy/cupy
-[Demucs]: https://github.com/facebookresearch/demucs
-
---- Complete PatchCNN Output Pipline ---
-
-Audio (16kHz waveform)
-    ↓
-[1] CFP Feature Extraction
-    ↓
-Z: CFP representation (frequency × time)
-    Shape: (~175 freq bins, ~500 time frames for 10-sec audio)
-    ↓
-[2] Peak Detection + Patch Extraction
-    ↓
-data: Array of 25×25 patches
-    Shape: (N_patches, 25, 25)  where N_patches ≈ 1000-3000
-mapping: Location of each patch
-    Shape: (N_patches, 2)  [frequency_idx, time_idx]
-    ↓
-[3] PatchCNN Model (KitModel.forward) ← THE MODEL
-    ↓
-pred: Classification probabilities
-    Shape: (N_patches, 2)
-    Values: [P(non-vocal), P(vocal)] for each patch
-    ↓
-[4] Contour Reconstruction
-    ↓
-result: Final pitch contour
-    Shape: (N_frames, 2)
-    Values: [[time₁, frequency₁],
-             [time₂, frequency₂],
-             [time₃, frequency₃],
-             ...]
