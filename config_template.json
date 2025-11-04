@@ -1,0 +1,36 @@
+{
+    "model_config": {
+        "model_type": "gru_attention",
+        "hidden_dim": 256,
+        "num_layers": 2,
+        "num_heads": 8,
+        "dropout_rate": 0.3
+    },
+    "training_config": {
+        "learning_rate": 0.001,
+        "batch_size": 32,
+        "num_epochs": 100,
+        "weight_decay": 1e-4,
+        "grad_clip": 1.0,
+        "optimizer": "adam",
+        "scheduler": "plateau"
+    },
+    "data_config": {
+        "augment": true,
+        "normalize": true,
+        "train_split": 0.8,
+        "val_split": 0.2
+    },
+    "system_config": {
+        "device": "auto",
+        "num_workers": 4,
+        "pin_memory": true,
+        "use_amp": false
+    },
+    "logging_config": {
+        "save_checkpoints": true,
+        "checkpoint_interval": 10,
+        "plot_curves": true,
+        "tensorboard": false
+    }
+}
