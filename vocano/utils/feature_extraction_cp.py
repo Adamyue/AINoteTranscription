@@ -240,7 +240,24 @@ class temp_dataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.data.shape[0]
 
-def patch_extraction(Z, patch_size, th):
+def patch_extraction(Z, patch_size, th, max_patches=None):
+    """
+    Extract patches from time-frequency representation.
+    
+    Args:
+        Z: Time-frequency representation (spectrogram)
+        patch_size: Size of each patch (typically 25)
+        th: Threshold for peak detection
+        max_patches: Maximum number of patches to extract (None = unlimited)
+                     Default: 1500000 (optimized for 8GB GPU)
+    
+    Returns:
+        data: Array of extracted patches
+        mapping: Array of (frequency_idx, time_idx) for each patch
+        half_ps: Half patch size
+        N: Number of time frames
+        Z: Processed time-frequency representation
+    """
     # Z is the input spectrogram or any kind of time-frequency representation
     M, N = Z.shape    
     half_ps = int(np.floor(float(patch_size)/2)) #12
@@ -252,19 +269,35 @@ def patch_extraction(Z, patch_size, th):
     data = []
     mapping = []
     counter = 0
+    
+    # Default limit for backward compatibility (optimized for 8GB GPU)
+    if max_patches is None:
+        max_patches = 1500000
+    
     for t_idx in range(half_ps, N-half_ps):
         LOCS = findpeaks(Z[:,t_idx], th)
         for mm in range(0, len(LOCS)):
-            if LOCS[mm] >= half_ps and LOCS[mm] < M - half_ps and counter<300000:# and PKS[mm]> 0.5*max(Z[:,t_idx]):
+            # Check if within valid bounds
+            if LOCS[mm] >= half_ps and LOCS[mm] < M - half_ps:
+                # Check patch limit (if max_patches is set)
+                if max_patches is not None and counter >= max_patches:
+                    print(f'Warning: Reached patch limit ({max_patches}). '
+                          f'Some peaks will be skipped. Consider shortening the audio or increasing max_patches.')
+                    break  # Break inner loop to move to next time frame
+                
                 patch = Z[np.ix_(range(LOCS[mm]-half_ps, LOCS[mm]+half_ps+1), range(t_idx-half_ps, t_idx+half_ps+1))]
                 data.append(patch)
                 mapping.append((LOCS[mm], t_idx))
                 counter = counter + 1
-            elif LOCS[mm] >= half_ps and LOCS[mm] < M - half_ps and counter>=300000:
-                print('Out of the biggest size. Please shorten the input audio.')
                 
-    data = np.array(data[:-1])
-    mapping = np.array(mapping[:-1])
+    # Convert to numpy arrays (remove last element only if limit was hit and we need to clean up)
+    if data:
+        data = np.array(data)
+        mapping = np.array(mapping)
+    else:
+        data = np.array([])
+        mapping = np.array([])
+    
     Z = Z[:M-half_ps,:]
     return data, mapping, half_ps, N, Z
 

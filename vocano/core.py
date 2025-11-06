@@ -24,9 +24,10 @@ from google_drive_downloader import GoogleDriveDownloader as gdd
 
 from .model.PyramidNet_ShakeDrop import PyramidNet_ShakeDrop
 from .model.GRU_Attention import GRU_Attention_Model, Simplified_GRU_Attention_Model
-from .utils.evaluate_tools import Smooth_sdt6_modified, Naive_pitch, eval_note_acc
+from .utils.evaluate_tools import Smooth_sdt6_modified, Naive_pitch, eval_note_acc, compare_methods, load_gt_csv_as_est
 from .utils.dataset import EvalDataset
 from .utils.est2midi import Est2MIDI
+from .utils.refine import refine_intervals_with_probabilities
 
 def package_check(package_name: str):
     spec = importlib.util.find_spec(package_name)
@@ -186,6 +187,7 @@ class SingingVoiceTranscription:
         print(f"Feature extraction start...")
         if use_cp:
             try:
+                print(f"Using CuPy for feature extraction...")
                 feature, pitch = feature_extraction_cp(filename=wavfile_dir, use_ground_truth=self.args.use_groundtruth, 
                                                        batch_size=self.args.batch_size, num_workers=self.args.num_workers,
                                                        pin_memory=self.args.pin_memory, device=self.device)
@@ -195,6 +197,7 @@ class SingingVoiceTranscription:
                 else:
                     self._free_gpu()
                     print(f"Filesize too large. Trying with numpy solution.")
+                    print(f"Using Numpy for feature extraction...")
                     feature, pitch = feature_extraction_np(filename=wavfile_dir, use_ground_truth=self.args.use_groundtruth, 
                                                            batch_size=self.args.batch_size, num_workers=self.args.num_workers,
                                                            pin_memory=self.args.pin_memory, device=self.device)
@@ -313,21 +316,20 @@ class SingingVoiceTranscription:
         outputs = torch.cat(outputs)
         raw_outputs = torch.cat(raw_outputs)
         
-        # Save raw feature_extractor outputs to 'ond' folder
-        raw_outputs_np = raw_outputs.numpy()
-        raw_outputs_path = ond_dir / f"{self.args.name}_raw_outputs.npy"
-        np.save(raw_outputs_path, raw_outputs_np)
-        print(f"Raw feature_extractor outputs saved to {raw_outputs_path}")
+        # Save per-pair softmax probabilities (paper's [s,a,o,\u00afo,f,\u00aff]) to 'ond' folder
+        probs_np = outputs.numpy()
+        probs_path = ond_dir / f"{self.args.name}_probabilities.npy"
+        np.save(probs_path, probs_np)
+        print(f"Per-pair probabilities saved to {probs_path}")
         
-        # Also save as CSV for easier inspection (first 1000 samples)
-        csv_path = ond_dir / f"{self.args.name}_raw_outputs.csv"
-        sample_size = min(1000, raw_outputs_np.shape[0])
+        # Also save as CSV for easier inspection (all samples)
+        csv_path = ond_dir / f"{self.args.name}_probabilities.csv"
         with open(csv_path, 'w', newline='') as csvfile:
             csv_writer = csv.writer(csvfile)
-            csv_writer.writerow(['sample_idx'] + [f'output_{i}' for i in range(raw_outputs_np.shape[1])])
-            for i in range(sample_size):
-                csv_writer.writerow([i] + raw_outputs_np[i].tolist())
-        print(f"Raw feature_extractor outputs sample (first {sample_size} samples) saved to {csv_path}")
+            csv_writer.writerow(['sample_idx'] + [f'prob_{i}' for i in range(probs_np.shape[1])])
+            for i in range(probs_np.shape[0]):
+                csv_writer.writerow([i] + probs_np[i].tolist())
+        print(f"Per-pair probabilities (all {probs_np.shape[0]} samples) saved to {csv_path}")
         
         # --- post processing ---
         p_np = self.pitch
@@ -338,22 +340,115 @@ class SingingVoiceTranscription:
         print(f"pitch_intervals: {pitch_intervals.shape}")
         # print(f"sSeq_np: {sSeq_np.shape}")
         # print(f"dSeq_np: {dSeq_np.shape}")
-        # print(f"onSeq_np: {onSeq_np.shape}")
+        # print(f"onSeq_np: {onSeq_np}")
         # print(f"offSeq_np: {offSeq_np.shape}")
         print(f"conflict_ratio: {conflict_ratio}")
 
-        freq_est = Naive_pitch(p_np, pitch_intervals)
-            
-        # --- for midi ---
-        self.est = np.hstack((pitch_intervals, freq_est.reshape((-1,1))))
-        print(f"self.est:{self.est}")
+        # --- compute both original and refined methods for comparison ---
+        # Original method
+        freq_est_original = Naive_pitch(p_np, pitch_intervals)
+        est_original = np.hstack((pitch_intervals, freq_est_original.reshape((-1,1))))
+        
+        # Refined method (sub-frame refinement using parabolic method)
+        pitch_intervals_refined = refine_intervals_with_probabilities(
+            pitch_intervals, onSeq_np, offSeq_np, 
+            method='parabolic', window_frames=2, upsample=10
+        )
+        print(f"Refined pitch_intervals: {pitch_intervals_refined.shape}")
+        freq_est_refined = Naive_pitch(p_np, pitch_intervals_refined)
+        est_refined = np.hstack((pitch_intervals_refined, freq_est_refined.reshape((-1,1))))
+        
+        # Use refined method as final output
+        self.est = est_refined
+        # print(f"self.est:{self.est}")
+        
+        # --- comprehensive comparison if ground truth available ---
+        try:
+            # Get base name from wavfile_dir (without extension) for GT file lookup
+            # Strip "_vocals" suffix if present (e.g., "song_vocals.wav" -> "song")
+            wavfile_base = Path(self.args.wavfile_dir).stem
+            if wavfile_base.endswith("_vocals"):
+                wavfile_base = wavfile_base[:-7]  # Remove "_vocals" (7 characters)
+            gt_notes_path = Path("D:/FYP/AI-Vocal-Transcription/VOCANO/dataset/gt_notes") / f"{wavfile_base}.csv"
+            if gt_notes_path.is_file():
+                print("\n" + "="*80)
+                print("COMPREHENSIVE METHOD COMPARISON")
+                print("="*80)
+                
+                gt_notes = load_gt_csv_as_est(gt_notes_path)
+                comparison = compare_methods(gt_notes, est_original, est_refined)
+                
+                # Print detailed comparison
+                print(f"\nGround Truth Notes: {comparison['gt_count']}")
+                print(f"\n{'Metric':<35} {'Original':<18} {'Refined':<18} {'Improvement':<18}")
+                print("-" * 90)
+                
+                orig = comparison['original']
+                ref = comparison['refined']
+                imp = comparison['improvements']
+                
+                # Main F1-score (onset-offset-pitch): F(50, 0.05, 0.2)
+                print(f"{'F1 (Onset-Offset-Pitch)':<35} {orig['f1_onset_offset_pitch']:<18.4f} {ref['f1_onset_offset_pitch']:<18.4f} {imp['f1_improvement']:+.4f}")
+                print(f"{'F1 (Onset-Only)':<35} {orig['f1_onset_only']:<18.4f} {ref['f1_onset_only']:<18.4f} {imp['f1_onset_only_improvement']:+.4f}")
+                print(f"{'F1 (Offset-Only)':<35} {orig['f1_offset_only']:<18.4f} {ref['f1_offset_only']:<18.4f} {imp['f1_offset_only_improvement']:+.4f}")
+                print(f"{'F1 (Onset-Offset)':<35} {orig['f1_onset_offset']:<18.4f} {ref['f1_onset_offset']:<18.4f} {imp['f1_onset_offset_improvement']:+.4f}")
+                print(f"{'F1 (Onset-Pitch)':<35} {orig['f1_onset_pitch']:<18.4f} {ref['f1_onset_pitch']:<18.4f} {imp['f1_onset_pitch_improvement']:+.4f}")
+                print("-" * 90)
+                print(f"{'Precision':<35} {orig['precision']:<18.4f} {ref['precision']:<18.4f} {imp['precision_improvement']:+.4f}")
+                print(f"{'Recall':<35} {orig['recall']:<18.4f} {ref['recall']:<18.4f} {imp['recall_improvement']:+.4f}")
+                print(f"{'Note Accuracy (NAcc)':<35} {orig['nacc']:<18.4f} {ref['nacc']:<18.4f} {imp['nacc_improvement']:+.4f}")
+                print(f"{'True Positives':<35} {orig['tp']:<18} {ref['tp']:<18}")
+                print(f"{'False Positives':<35} {orig['fp']:<18} {ref['fp']:<18}")
+                print(f"{'False Negatives':<35} {orig['fn']:<18} {ref['fn']:<18}")
+                print(f"{'Total Estimated Notes':<35} {orig['num_notes']:<18} {ref['num_notes']:<18}")
+                
+                print(f"\n{'Timing Errors (matched notes only)':<30} {'Original':<20} {'Refined':<20} {'Reduction':<20}")
+                print("-" * 90)
+                print(f"{'Mean Onset Error (s)':<30} {orig['mean_onset_error']*1000:<20.2f} {ref['mean_onset_error']*1000:<20.2f} {imp['onset_error_reduction']*1000:+.2f} ms")
+                print(f"{'Std Onset Error (s)':<30} {orig['std_onset_error']*1000:<20.2f} {ref['std_onset_error']*1000:<20.2f}")
+                print(f"{'Mean Offset Error (s)':<30} {orig['mean_offset_error']*1000:<20.2f} {ref['mean_offset_error']*1000:<20.2f} {imp['offset_error_reduction']*1000:+.2f} ms")
+                print(f"{'Std Offset Error (s)':<30} {orig['std_offset_error']*1000:<20.2f} {ref['std_offset_error']*1000:<20.2f}")
+                print(f"{'Mean Duration Error (s)':<30} {orig['mean_duration_error']*1000:<20.2f} {ref['mean_duration_error']*1000:<20.2f}")
+                print(f"{'Std Duration Error (s)':<30} {orig['std_duration_error']*1000:<20.2f} {ref['std_duration_error']*1000:<20.2f}")
+                
+                print(f"\n{'Pitch Errors (matched notes only)':<30} {'Original':<20} {'Refined':<20} {'Reduction':<20}")
+                print("-" * 90)
+                print(f"{'Mean Pitch Error (cents)':<30} {orig['mean_pitch_error_cents']:<20.2f} {ref['mean_pitch_error_cents']:<20.2f} {imp['pitch_error_reduction']:+.2f} cents")
+                print(f"{'Std Pitch Error (cents)':<30} {orig['std_pitch_error_cents']:<20.2f} {ref['std_pitch_error_cents']:<20.2f}")
+                
+                print("\n" + "="*80)
+                print("SUMMARY: Refined method shows improvements in:")
+                improvements_list = []
+                if imp['f1_improvement'] > 0:
+                    improvements_list.append(f"F1-Score (+{imp['f1_improvement']:.4f})")
+                if imp['onset_error_reduction'] > 0:
+                    improvements_list.append(f"Onset timing (-{imp['onset_error_reduction']*1000:.2f}ms)")
+                if imp['offset_error_reduction'] > 0:
+                    improvements_list.append(f"Offset timing (-{imp['offset_error_reduction']*1000:.2f}ms)")
+                if imp['nacc_improvement'] > 0:
+                    improvements_list.append(f"Note Accuracy (+{imp['nacc_improvement']:.4f})")
+                
+                if improvements_list:
+                    print("  " + ", ".join(improvements_list))
+                else:
+                    print("  No significant improvements detected (may need stricter tolerances)")
+                print("="*80 + "\n")
+            else:
+                print(f"Ground-truth file not found: {gt_notes_path}. Skipping comparison.")
+        except Exception as e:
+            print(f"Comparison failed: {e}")
 
         self.sdt = np.hstack((sSeq_np.reshape((-1,1)), dSeq_np.reshape((-1,1)), onSeq_np.reshape((-1,1)), offSeq_np.reshape((-1,1))))
 
         # --- for evaluation with note accuracy ---
         # Load ground-truth note sequence (frequencies) if available and compute sequence-level accuracy
         try:
-            gt_notes_path = Path("D:/FYP/AI-Vocal-Transcription/VOCANO/dataset/gt_notes") / f"{self.args.name}.csv"
+            # Get base name from wavfile_dir (without extension) for GT file lookup
+            # Strip "_vocals" suffix if present (e.g., "song_vocals.wav" -> "song")
+            wavfile_base = Path(self.args.wavfile_dir).stem
+            if wavfile_base.endswith("_vocals"):
+                wavfile_base = wavfile_base[:-7]  # Remove "_vocals" (7 characters)
+            gt_notes_path = Path("D:/FYP/AI-Vocal-Transcription/VOCANO/dataset/gt_notes") / f"{wavfile_base}.csv"
             if gt_notes_path.is_file():
                 gt_csv = np.genfromtxt(gt_notes_path, delimiter=",", skip_header=1)
                 # Column order: start_time, end_time, frequency
@@ -370,7 +465,7 @@ class SingingVoiceTranscription:
         # experiment for NAcc: 
         # song: A_Day_To_Remember-Casablanca_Sucked_Anyways
         # note_accuracy: 0.4864864864864865
-
+        
         # --- free GPU ---
         self._free_gpu()
         
